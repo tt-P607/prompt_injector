@@ -1,0 +1,22 @@
+{
+  "name": "prompt_injector",
+  "version": "1.0.0",
+  "description": "动态提示词注入插件，支持按群聊 / 私聊范围控制 default_chatter user prompt extra 注入内容。",
+  "author": "bingyv92",
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "event_handler",
+      "component_name": "prompt_injector_handler",
+      "dependencies": [],
+      "enabled": true
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0",
+  "python_dependencies": [],
+  "dependencies_required": false
+}
