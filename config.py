@@ -13,16 +13,50 @@ from src.app.plugin_system.base import BaseConfig, Field, SectionBase, config_se
 class InjectionEntry(SectionBase):
     """单条提示词注入规则。
 
-    targets 均为空时对所有聊天流全局生效；
-    group_targets 非空则仅限列表中的群聊；
-    user_targets 非空则仅限列表中的私聊；
-    两者均非空则对其并集生效。
+    **作用域匹配：**
+    - include/exclude 均为空 → 全局生效（所有聊天）
+    - include 非空 → 仅匹配列表中指定的聊天流
+    - exclude 非空 → 从命中集合中排除指定聊天流
+
+    **include/exclude 格式：**
+    - ``"group:*"``   — 所有群聊
+    - ``"group:123"`` — 群号为 123 的群聊
+    - ``"user:*"``    — 所有私聊
+    - ``"user:456"``  — QQ 号为 456 的私聊
+
+    **per-rule 模板控制：**
+    - target_prompts 非空 → 覆盖全局 plugin.target_prompts，仅注入到指定模板
+    - target_prompts 为空 → 沿用全局配置
     """
 
-    content: str = Field(default="")
-    group_targets: list[str] = Field(default_factory=list)
-    user_targets: list[str] = Field(default_factory=list)
-    enabled: bool = Field(default=True)
+    content: str = Field(default="", description="要注入的提示词内容")
+    enabled: bool = Field(default=True, description="是否启用此规则")
+
+    # ── 作用域：聊天流匹配 ──
+    include: list[str] = Field(
+        default_factory=list,
+        description=(
+            "命中范围。为空时全局生效。\n"
+            '格式："group:*" "group:群号" "user:*" "user:QQ号"'
+        ),
+    )
+    exclude: list[str] = Field(
+        default_factory=list,
+        description=(
+            "从命中范围中排除。格式同 include。\n"
+            '示例：exclude = ["group:123456"] 表示排除该群。'
+        ),
+    )
+
+    # ── 作用域：模板控制 ──
+    target_prompts: list[str] = Field(
+        default_factory=list,
+        description=(
+            "此规则注入的模板名称列表，覆盖全局 plugin.target_prompts。\n"
+            "为空时沿用全局配置。\n"
+            "可选值：default_chatter_user_prompt / kfc_system_prompt / kfc_user_prompt"
+        ),
+    )
 
 
 class PromptInjectorConfig(BaseConfig):
@@ -48,8 +82,9 @@ class PromptInjectorConfig(BaseConfig):
             description=(
                 "要注入的提示词模板名称，对应 on_prompt_build 事件的 name 字段。\n"
                 "default_chatter_user_prompt：dfc 用户提示词 {extra} 占位符（默认）\n"
-                "kfc_system_prompt：kfc 系统提示词末尾（手动添加）\n"
-                '两者同时支持示例：target_prompts = ["default_chatter_user_prompt", "kfc_system_prompt"]'
+                "kfc_system_prompt：kfc 系统提示词末尾\n"
+                "kfc_user_prompt：kfc 用户消息末尾（新消息旁边）\n"
+                '示例：target_prompts = ["default_chatter_user_prompt", "kfc_user_prompt"]'
             ),
         )
 
@@ -59,20 +94,28 @@ class PromptInjectorConfig(BaseConfig):
         default_factory=lambda: [
             InjectionEntry(
                 content="在所有对话中，你的语气应该亲切自然。",
-                group_targets=[],
-                user_targets=[],
                 enabled=False,
             ),
             InjectionEntry(
                 content="这是技术群，优先帮用户解决技术问题。",
-                group_targets=["123456789"],
-                user_targets=[],
+                include=["group:123456789"],
                 enabled=False,
             ),
             InjectionEntry(
                 content="和这位朋友说话可以随意一点。",
-                group_targets=[],
-                user_targets=["987654321"],
+                include=["user:987654321"],
+                enabled=False,
+            ),
+            InjectionEntry(
+                content="这条规则仅注入到 KFC 用户提示词，对 DFC 无效。",
+                include=["user:*"],
+                target_prompts=["kfc_user_prompt"],
+                enabled=False,
+            ),
+            InjectionEntry(
+                content="这条规则注入所有群聊，但排除指定群。",
+                include=["group:*"],
+                exclude=["group:111111111"],
                 enabled=False,
             ),
         ],

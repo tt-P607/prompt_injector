@@ -1,7 +1,7 @@
 """prompt_injector 事件处理器。
 
-订阅 on_prompt_build 事件，在 default_chatter user prompt 构建前
-根据配置规则向 extra 占位符追加自定义提示词内容。
+订阅 on_prompt_build 事件，在 chatter prompt 构建时
+根据配置规则向指定模板注入自定义提示词内容。
 """
 
 from __future__ import annotations
@@ -22,28 +22,55 @@ logger = get_logger("prompt_injector")
 _DFC_PROMPT = "default_chatter_user_prompt"
 
 
-def _build_private_stream_id(platform: str, user_id: str) -> str:
-    """构造私聊聊天流 ID（与框架 ChatStream.generate_stream_id 逻辑保持一致）。
+def _scope_matches(spec: str, chat_type: str, chat_id: str, platform: str = "") -> bool:
+    """判断单条作用域字符串是否命中当前聊天流。
 
     Args:
-        platform: 平台标识
-        user_id: 用户 QQ 号
+        spec: 格式为 "group:*" / "group:123" / "user:*" / "user:456"
+        chat_type: 聊天类型，"group" 或 "private"
+        chat_id: 群号（group）或原始 person_id 哈希（private）
+        platform: 平台标识，用于计算私聊用户哈希
 
     Returns:
-        str: SHA-256 哈希的 stream_id
+        bool: 是否命中
     """
-    key = f"{platform}_{user_id}_private"
-    return hashlib.sha256(key.encode()).hexdigest()
+    if ":" not in spec:
+        return False
+    kind, value = spec.split(":", 1)
+    kind = kind.strip().lower()
+    value = value.strip()
+
+    if kind == "group":
+        if chat_type != "group":
+            return False
+        return value == "*" or value == chat_id
+    if kind == "user":
+        if chat_type != "private":
+            return False
+        if value == "*":
+            return True
+        # value 是原始 QQ 号，需要与哈希后的 person_id 比较
+        if platform:
+            expected = hashlib.sha256(f"{platform}_{value}".encode()).hexdigest()
+            return expected == chat_id
+        # 没有 platform 时退而求其次直接比较（兼容）
+        return value == chat_id
+    return False
 
 
 def _entry_matches(entry: "InjectionEntry", stream_info: dict[str, Any]) -> bool:
-    """判断单条注入规则是否对当前聊天流生效。
+    """判断单条注入规则的聊天流作用域是否命中当前流。
 
-    匹配语义：
-    - group_targets 与 user_targets 均为空 → 对所有聊天流生效
-    - 仅 group_targets 非空 → 只匹配其中指定的群聊，私聊不生效
-    - 仅 user_targets 非空 → 只匹配其中指定的私聊，群聊不生效
-    - 两者均非空 → 匹配指定群聊 + 指定私聊的并集
+    **规则：**
+    - include/exclude 均为空 → 全局生效
+    - include 非空 → 至少命中一条 include 规则才算命中
+    - exclude 非空 → 命中任意一条 exclude 则排除
+
+    **include/exclude 格式：**
+    - ``"group:*"``   — 所有群聊
+    - ``"group:123"`` — 指定群
+    - ``"user:*"``    — 所有私聊
+    - ``"user:456"``  — 指定私聊用户
 
     Args:
         entry: 单条注入规则配置
@@ -52,45 +79,43 @@ def _entry_matches(entry: "InjectionEntry", stream_info: dict[str, Any]) -> bool
     Returns:
         bool: 当前规则是否对该聊天流生效
     """
-    has_group_filter = bool(entry.group_targets)
-    has_user_filter = bool(entry.user_targets)
-
-    # 两个列表均为空，全局生效
-    if not has_group_filter and not has_user_filter:
-        return True
-
-    chat_type = stream_info.get("chat_type", "")
-    actual_stream_id = stream_info.get("stream_id", "")
+    chat_type = str(stream_info.get("chat_type", ""))
     platform = str(stream_info.get("platform", ""))
+    # 群聊用 group_id，私聊用 person_id（哈希格式）
+    if chat_type == "group":
+        chat_id = str(stream_info.get("group_id") or "")
+    else:
+        chat_id = str(stream_info.get("person_id") or "")
 
-    if chat_type == "group" and has_group_filter:
-        group_id = str(stream_info.get("group_id") or "")
-        return group_id in entry.group_targets
+    # include 为空 → 全局生效，否则至少命中一条
+    if entry.include:
+        if not any(_scope_matches(spec, chat_type, chat_id, platform) for spec in entry.include):
+            return False
 
-    if chat_type == "private" and has_user_filter:
-        for uid in entry.user_targets:
-            if platform and uid:
-                expected = _build_private_stream_id(platform, uid)
-                if expected == actual_stream_id:
-                    return True
-        return False
+    # exclude：命中任意一条则排除
+    if entry.exclude:
+        if any(_scope_matches(spec, chat_type, chat_id, platform) for spec in entry.exclude):
+            return False
 
-    # chat_type 不属于已配置的过滤类型，不匹配
-    return False
+    return True
 
 
 class PromptInjectorHandler(BaseEventHandler):
     """自定义提示词注入器。
 
-    订阅 ``on_prompt_build`` 事件，当 ``default_chatter_user_prompt``
-    模板即将构建时，根据配置规则向 ``values["extra"]`` 追加提示词内容。
+    订阅 ``on_prompt_build`` 事件，根据配置规则和当前提示词模板名称
+    向目标模板注入自定义提示词内容。
 
-    多条规则均命中时，按配置顺序拼接后一次性追加，与其他注入器
-    （booku_memory、notice_injector）通过换行累加、互不干扰。
+    支持：
+    - 全局 target_prompts 控制注入哪个模板
+    - 每条规则独立的 target_prompts 字段（覆盖全局）
+    - include/exclude 作用域控制（格式："group:*" "user:123" 等）
+
+    多条规则均命中时，按配置顺序拼接后一次性注入，与其他注入器互不干扰。
     """
 
     handler_name: str = "prompt_injector_handler"
-    handler_description: str = "在 default_chatter user prompt extra 板块注入自定义提示词"
+    handler_description: str = "在目标 prompt 中注入自定义提示词（支持 dfc/kfc 多模板、include/exclude 作用域）"
     weight: int = 15
     intercept_message: bool = False
     init_subscribe: list[str] = ["on_prompt_build"]
@@ -114,7 +139,10 @@ class PromptInjectorHandler(BaseEventHandler):
 
         支持所有触发 on_prompt_build 事件的 chatter：
         - default_chatter_user_prompt → 注入到 values["extra"] 占位符
-        - kfc_system_prompt 等 → 追加到 params["template"] 末尾
+        - kfc_system_prompt / kfc_user_prompt 等 → 追加到 params["template"] 末尾
+
+        每条规则可通过 target_prompts 字段独立控制注入目标；
+        为空时沿用全局 plugin.target_prompts 配置。
 
         Args:
             event_name: 事件名称
@@ -127,9 +155,14 @@ class PromptInjectorHandler(BaseEventHandler):
         if not config.plugin.enabled:
             return EventDecision.SUCCESS, params
 
-        # 仅处理已配置的目标模板
         prompt_name: str = params.get("name", "")
-        if prompt_name not in config.plugin.target_prompts:
+        global_target_prompts: list[str] = config.plugin.target_prompts
+
+        # 全局过滤：如果当前模板不在任何规则的目标列表（包括全局和 per-rule）中，直接跳过
+        is_relevant = prompt_name in global_target_prompts or any(
+            prompt_name in (entry.target_prompts or []) for entry in config.inject if entry.enabled
+        )
+        if not is_relevant:
             return EventDecision.SUCCESS, params
 
         values = params.get("values", {})
@@ -154,12 +187,17 @@ class PromptInjectorHandler(BaseEventHandler):
             return EventDecision.SUCCESS, params
 
         # 收集所有命中规则的内容
+        # 每条规则先检查 per-rule target_prompts，再检查聊天流匹配
         collected: list[str] = []
         for entry in config.inject:
             if not entry.enabled:
                 continue
             content = entry.content.strip()
             if not content:
+                continue
+            # per-rule 模板过滤：非空时覆盖全局，为空时沿用全局
+            rule_targets = entry.target_prompts if entry.target_prompts else global_target_prompts
+            if prompt_name not in rule_targets:
                 continue
             if _entry_matches(entry, stream_meta):
                 collected.append(content)
@@ -175,13 +213,9 @@ class PromptInjectorHandler(BaseEventHandler):
                 f"stream_id={stream_id[:8]}...): {injected!r}"
             )
 
-        # dfc 通过 values["extra"] 注入到用户提示词占位符；
-        # kfc 等其他 chatter 无 {extra} 占位符，追加到系统提示词模板末尾
-        if prompt_name == _DFC_PROMPT:
-            existing = str(values.get("extra", ""))
-            values["extra"] = (existing + "\n" + injected) if existing else injected
-        else:
-            template: str = str(params.get("template", ""))
-            params["template"] = template + "\n\n" + injected
+        # 所有 chatter 均通过 values["extra"] 注入额外内容；
+        # builder 负责将 extra 提取为独立 payload（kfc）或占位符替换（dfc）
+        existing = str(values.get("extra", ""))
+        values["extra"] = (existing + "\n" + injected) if existing else injected
 
         return EventDecision.SUCCESS, params
