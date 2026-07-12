@@ -1,7 +1,7 @@
 {
   "name": "prompt_injector",
   "display_name": "提示词动态注入",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "动态提示词注入插件，支持按群聊 / 私聊范围控制提示词注入内容。",
   "author": "言柒",
   "license": "AGPL-v3.0",

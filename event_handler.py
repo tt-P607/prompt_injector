@@ -1,7 +1,14 @@
 """prompt_injector 事件处理器。
 
 订阅 on_prompt_build 事件，在 chatter prompt 构建时
-根据配置规则向指定模板注入自定义提示词内容。
+根据配置规则向 SystemReminderStore 写入流隔离的提示词内容。
+
+工作原理：
+1. on_prompt_build 事件携带 stream_id，处理器据此匹配 include/exclude 规则
+2. 命中的规则按 insert_type/consume 分组，写入 SystemReminderStore 的 actor bucket
+3. 写入时指定 stream_id，实现 per-stream 隔离
+4. chatter 的 LLMContextManager 通过 with_reminder="actor" 自动拾取并注入
+5. DYNAMIC 模式会自动从历史 user 消息剥离旧注入，避免累积
 """
 
 from __future__ import annotations
@@ -11,15 +18,21 @@ from typing import TYPE_CHECKING, Any
 
 from src.app.plugin_system.api.event_api import EventDecision
 from src.app.plugin_system.api.log_api import get_logger
+from src.app.plugin_system.api.prompt_api import add_stream_reminder, delete_stream_reminder
 from src.app.plugin_system.api.stream_api import get_stream_info
 from src.app.plugin_system.base import BaseEventHandler
+from src.core.prompt import SystemReminderBucket, SystemReminderConsumeType, SystemReminderInsertType
 
 if TYPE_CHECKING:
     from .config import InjectionEntry, PromptInjectorConfig
 
 logger = get_logger("prompt_injector")
 
-_DFC_PROMPT = "default_chatter_user_prompt"
+# 写入 SystemReminderStore 时使用的专属 name，避免与其他插件的 reminder 冲突。
+# FOREVER 类规则和 ONCE 类规则分别使用不同 name，因为它们的消费模式不同，
+# 不能合并为单条 item（consume 是 per-item 属性）。
+_REMINDER_NAME_FOREVER = "prompt_injector_forever"
+_REMINDER_NAME_ONCE = "prompt_injector_once"
 
 
 def _scope_matches(spec: str, chat_type: str, chat_id: str, platform: str = "") -> bool:
@@ -103,19 +116,30 @@ def _entry_matches(entry: "InjectionEntry", stream_info: dict[str, Any]) -> bool
 class PromptInjectorHandler(BaseEventHandler):
     """自定义提示词注入器。
 
-    订阅 ``on_prompt_build`` 事件，根据配置规则和当前提示词模板名称
-    向目标模板注入自定义提示词内容。
+    订阅 ``on_prompt_build`` 事件，根据配置规则和当前聊天流
+    向 SystemReminderStore 写入流隔离的提示词内容。
+
+    注入机制：
+    - 不再直接修改模板的 ``values["extra"]``，避免内容被渲染进用户消息
+      文本后保存到历史、导致逐轮累积重复。
+    - 改为通过 ``prompt_api.add_stream_reminder()`` 写入 ``actor`` bucket
+      的流私有命名空间（``stream:{stream_id}:actor``），实现 per-stream 隔离。
+    - chatter 的 ``LLMContextManager`` 通过 ``with_reminder="actor"`` 自动
+      同时拾取全局 bucket 和流私有 bucket 的 reminder，
+      注入到最新 user 消息。
+    - ``DYNAMIC`` 模式会自动从历史 user 消息剥离旧注入，确保不累积。
 
     支持：
-    - 全局 target_prompts 控制注入哪个模板
-    - 每条规则独立的 target_prompts 字段（覆盖全局）
     - include/exclude 作用域控制（格式："group:*" "user:123" 等）
-
-    多条规则均命中时，按配置顺序拼接后一次性注入，与其他注入器互不干扰。
+    - per-rule 的 insert_type（dynamic/fixed）和 consume（forever/once）
+    - 多条规则按 consume 类型分组写入不同 name，避免互相覆盖
     """
 
     handler_name: str = "prompt_injector_handler"
-    handler_description: str = "在目标 prompt 中注入自定义提示词（支持 dfc/kfc 多模板、include/exclude 作用域）"
+    handler_description: str = (
+        "通过 SystemReminder 向 chatter 注入自定义提示词"
+        "（支持流隔离、include/exclude 作用域、dynamic/fixed 注入策略）"
+    )
     weight: int = 15
     intercept_message: bool = False
     init_subscribe: list[str] = ["on_prompt_build"]
@@ -135,34 +159,20 @@ class PromptInjectorHandler(BaseEventHandler):
         event_name: str,
         params: dict[str, Any],
     ) -> tuple[EventDecision, dict[str, Any]]:
-        """处理 on_prompt_build 事件，向目标 chatter 注入自定义提示词。
+        """处理 on_prompt_build 事件，向 SystemReminderStore 写入流隔离提示词。
 
-        支持所有触发 on_prompt_build 事件的 chatter：
-        - default_chatter_user_prompt → 注入到 values["extra"] 占位符
-        - kfc_system_prompt / kfc_user_prompt 等 → 追加到 params["template"] 末尾
-
-        每条规则可通过 target_prompts 字段独立控制注入目标；
-        为空时沿用全局 plugin.target_prompts 配置。
+        不修改 params 中的 values/template，仅向 reminder store 写入内容。
+        chatter 的 LLMContextManager 会在 add_payload 时自动拾取并注入。
 
         Args:
             event_name: 事件名称
             params: 事件参数，包含模板名称、values 等
 
         Returns:
-            tuple[EventDecision, dict]: 决策 + 更新后的参数
+            tuple[EventDecision, dict]: 决策 + 原样返回的参数（不修改）
         """
         config = self._get_config()
         if not config.plugin.enabled:
-            return EventDecision.SUCCESS, params
-
-        prompt_name: str = params.get("name", "")
-        global_target_prompts: list[str] = config.plugin.target_prompts
-
-        # 全局过滤：如果当前模板不在任何规则的目标列表（包括全局和 per-rule）中，直接跳过
-        is_relevant = prompt_name in global_target_prompts or any(
-            prompt_name in (entry.target_prompts or []) for entry in config.inject if entry.enabled
-        )
-        if not is_relevant:
             return EventDecision.SUCCESS, params
 
         values = params.get("values", {})
@@ -186,36 +196,68 @@ class PromptInjectorHandler(BaseEventHandler):
             )
             return EventDecision.SUCCESS, params
 
-        # 收集所有命中规则的内容
-        # 每条规则先检查 per-rule target_prompts，再检查聊天流匹配
-        collected: list[str] = []
+        # 收集所有命中规则的内容，按 consume 类型分组
+        forever_contents: list[str] = []
+        once_contents: list[str] = []
         for entry in config.inject:
             if not entry.enabled:
                 continue
             content = entry.content.strip()
             if not content:
                 continue
-            # per-rule 模板过滤：非空时覆盖全局，为空时沿用全局
-            rule_targets = entry.target_prompts if entry.target_prompts else global_target_prompts
-            if prompt_name not in rule_targets:
-                continue
             if _entry_matches(entry, stream_meta):
-                collected.append(content)
+                if entry.consume == "once":
+                    once_contents.append(content)
+                else:
+                    forever_contents.append(content)
 
-        if not collected:
-            return EventDecision.SUCCESS, params
-
-        injected = "\n".join(collected)
-
-        if config.plugin.debug_log:
-            logger.info(
-                f"[prompt_injector] 汇总注入内容 ({prompt_name}, "
-                f"stream_id={stream_id[:8]}...): {injected!r}"
+        # 写入流私有 reminder store（每次覆盖，实现"当前流最新匹配结果"）
+        # add_stream_reminder 是 set 语义（覆盖同名 item），无需手动清除旧内容。
+        # 但如果本轮没有命中任何规则，需要清除上一轮残留的内容。
+        if forever_contents:
+            forever_text = "\n".join(forever_contents)
+            add_stream_reminder(
+                stream_id=stream_id,
+                bucket=SystemReminderBucket.ACTOR.value,
+                name=_REMINDER_NAME_FOREVER,
+                content=forever_text,
+                insert_type=SystemReminderInsertType.DYNAMIC,
+                consume=SystemReminderConsumeType.FOREVER,
+            )
+        else:
+            # 本轮无 forever 规则命中，清除上一轮残留
+            delete_stream_reminder(
+                stream_id=stream_id,
+                bucket=SystemReminderBucket.ACTOR.value,
+                name=_REMINDER_NAME_FOREVER,
             )
 
-        # 所有 chatter 均通过 values["extra"] 注入额外内容；
-        # builder 负责将 extra 提取为独立 payload（kfc）或占位符替换（dfc）
-        existing = str(values.get("extra", ""))
-        values["extra"] = (existing + "\n" + injected) if existing else injected
+        if once_contents:
+            once_text = "\n".join(once_contents)
+            add_stream_reminder(
+                stream_id=stream_id,
+                bucket=SystemReminderBucket.ACTOR.value,
+                name=_REMINDER_NAME_ONCE,
+                content=once_text,
+                insert_type=SystemReminderInsertType.DYNAMIC,
+                consume=SystemReminderConsumeType.ONCE,
+            )
+        else:
+            delete_stream_reminder(
+                stream_id=stream_id,
+                bucket=SystemReminderBucket.ACTOR.value,
+                name=_REMINDER_NAME_ONCE,
+            )
+
+        if config.plugin.debug_log:
+            all_content = "\n".join(
+                part for part in [*[f"[forever] {c}" for c in forever_contents],
+                                  *[f"[once] {c}" for c in once_contents]]
+                if part
+            )
+            logger.info(
+                f"[prompt_injector] 写入 reminder (stream_id={stream_id[:8]}...): "
+                f"{all_content!r}"
+            )
 
         return EventDecision.SUCCESS, params
