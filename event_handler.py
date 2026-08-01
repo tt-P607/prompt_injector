@@ -135,8 +135,8 @@ class PromptInjectorHandler(BaseEventHandler):
     - 多条规则按 consume 类型分组写入不同 name，避免互相覆盖
     """
 
-    handler_name: str = "prompt_injector_handler"
-    handler_description: str = (
+    name: str = "prompt_injector_handler"
+    description: str = (
         "通过 SystemReminder 向 chatter 注入自定义提示词"
         "（支持流隔离、include/exclude 作用域、dynamic/fixed 注入策略）"
     )

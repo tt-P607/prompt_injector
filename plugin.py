@@ -32,7 +32,6 @@ class PromptInjectorPlugin(BasePlugin):
         "动态提示词注入插件，通过 SystemReminder 实现流隔离注入，"
         "支持 include/exclude 作用域、dynamic/fixed 注入策略、forever/once 消费模式"
     )
-    plugin_version = "2.0.0"
 
     configs: list[type] = [PromptInjectorConfig]
 

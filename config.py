@@ -90,8 +90,8 @@ class InjectionEntry(SectionBase):
 class PromptInjectorConfig(BaseConfig):
     """prompt_injector 插件配置模型。"""
 
-    config_name: ClassVar[str] = "config"
-    config_description: ClassVar[str] = "提示词注入插件配置"
+    name: ClassVar[str] = "config"
+    description: ClassVar[str] = "提示词注入插件配置"
 
     @config_section("plugin")
     class PluginSection(SectionBase):
