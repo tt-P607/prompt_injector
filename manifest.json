@@ -1,31 +1,35 @@
 {
-    "name": "prompt_injector",
-    "api_version": {"event_api": "1.0.0", "log_api": "1.0.0", "prompt_api": "1.0.0", "stream_api": "1.0.0"},
-
-    "display_name": "提示词动态注入",
-    "version": "1.1.0",
-    "description": "动态提示词注入插件，支持按群聊 / 私聊范围控制提示词注入内容。",
-    "author": "言柒",
-    "license": "AGPL-v3.0",
-    "categories": [
-        "tool"
-    ],
-    "tags": [
-        "prompt",
-        "injector",
-        "chatter"
-    ],
-    "dependencies": {
-        "plugins": [],
-        "components": []
-    },
-    "include": [
-        {
-            "component_type": "event_handler",
-            "component_name": "prompt_injector_handler",
-            "dependencies": []
-        }
-    ],
-    "entry_point": "plugin.py",
-    "min_core_version": "1.0.0"
+  "name": "prompt_injector",
+  "api_version": {
+    "event_api": "1.0.0",
+    "log_api": "1.0.0",
+    "prompt_api": "1.0.0",
+    "stream_api": "1.0.0"
+  },
+  "display_name": "提示词动态注入",
+  "version": "1.1.1",
+  "description": "动态提示词注入插件，支持按群聊 / 私聊范围控制提示词注入内容。",
+  "author": "言柒",
+  "license": "AGPL-v3.0",
+  "categories": [
+    "tool"
+  ],
+  "tags": [
+    "prompt",
+    "injector",
+    "chatter"
+  ],
+  "dependencies": {
+    "plugins": [],
+    "components": []
+  },
+  "include": [
+    {
+      "component_type": "event_handler",
+      "component_name": "prompt_injector_handler",
+      "dependencies": []
+    }
+  ],
+  "entry_point": "plugin.py",
+  "min_core_version": "1.0.0"
 }
