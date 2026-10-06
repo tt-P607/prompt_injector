@@ -4,10 +4,10 @@
     "event_api": "1.0.0",
     "log_api": "1.0.0",
     "prompt_api": "1.0.0",
-    "stream_api": "1.0.0"
+    "stream_api": "2.0.0"
   },
   "display_name": "提示词动态注入",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "动态提示词注入插件，支持按群聊 / 私聊范围控制提示词注入内容。",
   "author": "言柒",
   "license": "AGPL-v3.0",
